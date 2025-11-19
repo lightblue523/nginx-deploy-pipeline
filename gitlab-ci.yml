@@ -1,0 +1,222 @@
+stages:
+  - deploy
+
+.default_deploy_script: &deploy_script
+  image: rdidc-k8s-harbor.axiom-gaming.tech/devops/k8s:stable
+  tags:
+    - ags-rel
+  variables:
+    ECS_SSH_USER: nginxdeploy                         # ssh用戶名
+    DEPLOY_CONF_BASE: /opt/nginx/config/conf          # 目標機 nginx conf 目錄位置
+    DEPLOY_CONFD_BASE: /opt/nginx/config/conf.d       # 目標機 nginx conf.d 目錄位置
+    DEPLOY_SSL_BASE: /opt/nginx/config/ssl            # 目標機 nginx ssl 目錄位置
+    SCRIPT_BASE: /opt/nginx                           # nginx起停腳本位置
+    WAIT_SECONDS: 10
+    CONTAINER_NAME: nginx                             # nginx容器名稱
+    BACKUP_SUFFIX: .bak                               # 備份後綴
+  before_script:
+    - mkdir -p ~/.ssh
+    - echo "$ECS_SSH_KEY" | base64 -d > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "$ECS_SSH_HOST" >> ~/.ssh/known_hosts || echo "⚠️ ssh-keyscan 失敗"
+    - echo "🧪 SSH 連線測試..."
+    - ssh -o BatchMode=yes -o ConnectTimeout=5 $ECS_SSH_USER@$ECS_SSH_HOST 'echo ✅ SSH 連線成功' || {
+        echo "❌ SSH 無法連線，請檢查 ECS 的公網 IP、防火牆或金鑰是否正確";
+        exit 1;
+      }
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+
+.deploy_job_script: &deploy_job_script
+  script:
+    - echo "📦 檢查配置檔案..."
+    - |
+      if [ "$DEPLOY_MODE" = "auto" ]; then
+        if [ "$CI_COMMIT_BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+          echo "⚠️ before_sha 為 0，改用 HEAD~1"
+          git fetch origin main
+          CHANGED_CONF_FILES=$(git diff --name-only origin/main~1 $CI_COMMIT_SHA | grep 'nginx.conf$' || true)
+          CHANGED_CONFD_FILES=$(git diff --name-only origin/main~1 $CI_COMMIT_SHA | grep '\.conf$' | grep -v nginx.conf || true)
+          CHANGED_SSL_FILES=$(git diff --name-only origin/main~1 $CI_COMMIT_SHA | grep '\.pem$' || true)
+          CHANGED_SSL_DIRS=$(git diff --name-only origin/main~1 $CI_COMMIT_SHA | grep '\.pem$' | xargs -n1 dirname | uniq || true)
+        else
+          CHANGED_CONF_FILES=$(git diff --name-only $CI_COMMIT_BEFORE_SHA $CI_COMMIT_SHA | grep 'nginx.conf$' || true)
+          CHANGED_CONFD_FILES=$(git diff --name-only $CI_COMMIT_BEFORE_SHA $CI_COMMIT_SHA | grep '\.conf$' | grep -v nginx.conf || true)
+          CHANGED_SSL_FILES=$(git diff --name-only $CI_COMMIT_BEFORE_SHA $CI_COMMIT_SHA | grep '\.pem$' || true)
+          CHANGED_SSL_DIRS=$(git diff --name-only $CI_COMMIT_BEFORE_SHA $CI_COMMIT_SHA | grep '\.pem$' | xargs -n1 dirname | uniq || true)
+        fi
+      else
+        # 🟢 manual 模式直接查找工作區下所有 .conf
+        CHANGED_CONF_FILES=$(find conf -type f -name 'nginx.conf' || true)
+        CHANGED_CONFD_FILES=$(find conf.d -type f -name '*.conf' | grep -v nginx.conf || true)
+        CHANGED_SSL_FILES=$(find ssl -type f -name '*.pem' || true)
+        CHANGED_SSL_DIRS=$(find ssl -type f -name '*.pem' | xargs -n1 dirname | uniq || true)
+      fi
+
+    - |
+      # 初始化 SKIP_COUNT
+      SKIP_COUNT=0
+
+      # --- conf.d ---
+      echo -e "\033[1;37m------------------------------------------\033[0m"
+      echo -e "\033[1;37m--- 開始處理 conf.d，以下列出此次修改的檔案 ---\033[0m"
+      echo -e "\033[1;37m------------------------------------------\033[0m"
+      echo "$CHANGED_CONFD_FILES"
+      if [ -n "$CHANGED_CONFD_FILES" ]; then
+        for FILE in $CHANGED_CONFD_FILES; do
+          PROJECT=$(echo $FILE | cut -d'/' -f2)
+          ENV=$(echo $FILE | cut -d'/' -f3)
+          CONF_NAME=$(basename $FILE)
+          SERVICE_NAME=${CONF_NAME%.conf}
+          REMOTE_DIR=$DEPLOY_CONFD_BASE/$PROJECT/$ENV
+
+          echo "🚚 正在處理 conf.d 配置檔 $CONF_NAME"
+          echo "📂 上傳到 $REMOTE_DIR/"
+          ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            mkdir -p $REMOTE_DIR &&
+            cp $REMOTE_DIR/$CONF_NAME $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX 2>/dev/null || true
+          "
+          scp $FILE $ECS_SSH_USER@$ECS_SSH_HOST:$REMOTE_DIR/$CONF_NAME
+
+          echo "🔍 $CONF_NAME 配置檔已覆蓋，驗證配置檔語法正確性..."
+          confdVerifyResult=$(ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            sudo docker exec $CONTAINER_NAME nginx -t
+            echo \$?
+          ")
+          if [ $confdVerifyResult -ne 0 ]; then
+            echo "❌ $CONF_NAME 配置檔驗證失敗，開始回滾..."
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+              mv -f $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX $REMOTE_DIR/$CONF_NAME
+            "
+            echo -e "\033[1;31m❌❌❌ $CONF_NAME 回滾完畢，請檢察組態並於修改後再次部署。 ❌❌❌\033[0m"
+          else
+            echo "✔️ $CONF_NAME 驗證成功"
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "rm -f $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX"
+          fi
+        done
+      else
+        echo "✅ 沒有 conf.d 配置檔變更，跳過此部分"
+        SKIP_COUNT=$((SKIP_COUNT+1))
+      fi
+
+      # --- conf/nginx.conf ---
+      echo -e "\033[1;37m-------------------------------\033[0m"
+      echo -e "\033[1;37m--- 開始處理 conf/nginx.conf ---\033[0m"
+      echo -e "\033[1;37m-------------------------------\033[0m"
+      if [ -n "$CHANGED_CONF_FILES" ]; then
+        for FILE in $CHANGED_CONF_FILES; do
+          CONF_NAME=$(basename $FILE)
+          REMOTE_DIR=$DEPLOY_CONF_BASE
+
+          echo "🚚 正在處理 $CONF_NAME 配置檔"
+          echo "📂 上傳到 $REMOTE_DIR/"
+          ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            mkdir -p $REMOTE_DIR &&
+            cp $REMOTE_DIR/$CONF_NAME $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX 2>/dev/null || true
+          "
+          scp $FILE $ECS_SSH_USER@$ECS_SSH_HOST:$REMOTE_DIR/$CONF_NAME
+
+          echo "🔍 conf/nginx.conf 配置檔已覆蓋，驗證配置檔語法正確性..."
+          confVerifyResult=$(ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            sudo docker exec $CONTAINER_NAME nginx -t
+            echo \$?
+          ")
+          if [ $confVerifyResult -ne 0 ]; then
+            echo "❌ conf/nginx.conf 配置檔驗證失敗，開始回滾..."
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+              mv -f $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX $REMOTE_DIR/$CONF_NAME
+            "
+            echo -e "\033[1;31m❌❌❌ $CONF_NAME 回滾完畢，請檢察組態並於修改後再次部署。 ❌❌❌\033[0m"
+          else
+            echo "✔️ $CONF_NAME 驗證成功"
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "rm -f $REMOTE_DIR/$CONF_NAME$BACKUP_SUFFIX"
+          fi
+        done
+      else
+        echo "✅ 沒有 conf/nginx.conf 配置檔變更，跳過此部分"
+        SKIP_COUNT=$((SKIP_COUNT+1))
+      fi
+
+      # --- ssl (.pem) ---
+      echo -e "\033[1;37m-------------------------------------------\033[0m"
+      echo -e "\033[1;37m--- 開始處理 ssl 憑證，以下列出此次更動的憑證 ---\033[0m"
+      echo -e "\033[1;37m-------------------------------------------\033[0m"
+      echo "$CHANGED_SSL_FILES"
+      if [ -n "$CHANGED_SSL_DIRS" ]; then
+        for DIR in $CHANGED_SSL_DIRS; do
+          DIR_NAME=$(echo $DIR | cut -d'/' -f2)
+          REMOTE_DIR=$DEPLOY_SSL_BASE/$DIR_NAME
+
+          echo "🚚 正在更換 ssl憑證目錄 $DIR_NAME"
+          echo "📂 上傳到 $REMOTE_DIR/"
+          ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            mkdir -p $REMOTE_DIR &&
+            rm -rf /tmp/ssl-backup-tmp/$DIR_NAME$BACKUP_SUFFIX &&
+            cp -r $REMOTE_DIR /tmp/ssl-backup-tmp/$DIR_NAME$BACKUP_SUFFIX 2>/dev/null || true
+          "
+          scp -r $DIR $ECS_SSH_USER@$ECS_SSH_HOST:$DEPLOY_SSL_BASE
+
+          echo "🔍 $DIR_NAME 憑證已上傳，進行公私鑰比對驗證..."
+          sslVerifyResult=$(ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+            openssl x509 -in $REMOTE_DIR/fullchain.pem -pubkey -noout > /tmp/ssl-backup-tmp/cert_pub.pem &&
+            openssl pkey -in $REMOTE_DIR/privkey.pem -pubout > /tmp/ssl-backup-tmp/key_pub.pem &&
+            diff /tmp/ssl-backup-tmp/cert_pub.pem /tmp/ssl-backup-tmp/key_pub.pem >/dev/null 2>&1
+            echo \$?
+          ")
+          if [ $sslVerifyResult -ne 0 ]; then
+            echo "❌ 公私鑰比對驗證失敗，開始回滾..."
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+              mv -f /tmp/ssl-backup-tmp/$DIR_NAME$BACKUP_SUFFIX $REMOTE_DIR &&
+              rm -f /tmp/ssl-backup-tmp/cert_pub.pem && rm -f /tmp/ssl-backup-tmp/key_pub.pem
+            "
+            echo -e "\033[1;31m❌❌❌ $DIR_NAME 回滾完畢，請檢察憑證並於修改後再次部署。 ❌❌❌\033[0m"
+          else
+            echo "✔️ $DIR_NAME 驗證成功"
+            ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+              rm -rf /tmp/ssl-backup-tmp/$DIR_NAME$BACKUP_SUFFIX && rm -f /tmp/ssl-backup-tmp/cert_pub.pem && rm -f /tmp/ssl-backup-tmp/key_pub.pem
+            "
+          fi
+        done
+      else
+        echo "✅ 沒有 ssl憑證 變更，跳過部署此部分。"
+        SKIP_COUNT=$((SKIP_COUNT+1))
+      fi
+
+      # --- 檢查若無任何修改，則結束程序，跳過後續重啟。 ---
+      if [ "$SKIP_COUNT" -eq 3 ]; then
+        echo "✅ conf.d、conf、ssl 都沒有變更，跳過後續重啟，程序結束。"
+        exit 0
+      fi
+
+      # --- nginx 重啟 ---
+      echo "✅ 配置驗證完成，重啟 nginx..."
+      ssh $ECS_SSH_USER@$ECS_SSH_HOST "
+        cd $SCRIPT_BASE &&
+        sudo ./stop.sh &&
+        echo '⏳ 等待 $WAIT_SECONDS 秒...' &&
+        sleep $WAIT_SECONDS &&
+        sudo ./start.sh
+      "
+      echo "✅ Nginx 重啟完成"
+
+deploy_auto:
+  stage: deploy
+  extends:
+    - .default_deploy_script
+    - .deploy_job_script
+  variables:
+    DEPLOY_MODE: "auto"
+  only:
+    changes:
+      - conf/**/*
+      - conf.d/**/*
+      - ssl/**/*
+
+deploy_manual:
+  stage: deploy
+  extends:
+    - .default_deploy_script
+    - .deploy_job_script
+  variables:
+    DEPLOY_MODE: "manual"
+  when: manual
+  allow_failure: false
